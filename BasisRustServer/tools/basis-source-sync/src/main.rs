@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -141,6 +141,22 @@ fn detect_branch(repo_url: &str) -> Result<String> {
 /// Clone a specific branch from the repo to a temp directory
 fn clone_branch(repo_url: &str, branch: &str) -> Result<PathBuf> {
     let temp_dir = std::env::temp_dir().join("basis-sync");
+    let local_repo = PathBuf::from(repo_url);
+    let local_commit = if local_repo.exists() {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&local_repo)
+            .arg("rev-parse")
+            .arg(branch)
+            .output()
+            .context("resolving requested local source ref")?;
+        if !output.status.success() {
+            return Err(anyhow::anyhow!("Failed to resolve local source ref: {branch}"));
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    };
     // Remove existing directory if it exists
     if temp_dir.exists() {
         std::fs::remove_dir_all(&temp_dir)?;
@@ -149,18 +165,41 @@ fn clone_branch(repo_url: &str, branch: &str) -> Result<PathBuf> {
 
     let output = std::process::Command::new("git")
         .arg("clone")
-        .arg("--branch")
-        .arg(branch)
-        .arg("--depth")
-        .arg("1")
-        .arg("--single-branch")
+        .arg("--no-checkout")
         .arg(repo_url)
         .arg(&temp_dir)
         .output()
         .context("running git clone")?;
 
     if !output.status.success() {
-        return Err(anyhow::anyhow!("Failed to clone branch: {}", branch));
+        return Err(anyhow::anyhow!("Failed to clone repository"));
+    }
+    let checkout_target = if let Some(commit) = local_commit {
+        let fetch = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&temp_dir)
+            .arg("fetch")
+            .arg(repo_url)
+            .arg(&commit)
+            .output()
+            .context("fetching exact local source commit")?;
+        if !fetch.status.success() {
+            return Err(anyhow::anyhow!("Failed to fetch exact local source commit: {commit}"));
+        }
+        "FETCH_HEAD".to_string()
+    } else {
+        branch.to_string()
+    };
+    let checkout = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&temp_dir)
+        .arg("checkout")
+        .arg("--detach")
+        .arg(&checkout_target)
+        .output()
+        .context("checking out requested source ref")?;
+    if !checkout.status.success() {
+        return Err(anyhow::anyhow!("Failed to check out source ref: {branch}"));
     }
     Ok(temp_dir)
 }
@@ -182,14 +221,15 @@ fn detect_rust_source() -> Result<PathBuf> {
 }
 
 fn check_version(
-    temp_dir: &PathBuf,
-    rust_source: &PathBuf,
+    temp_dir: &Path,
+    rust_source: &Path,
     findings: &mut Vec<Finding>,
 ) -> Result<()> {
     let csharp = fs::read_to_string(
         temp_dir
             .join("Basis Server")
             .join("BasisNetworkCore")
+            .join("Protocol")
             .join("BasisNetworkVersion.cs"),
     )
     .context("reading BasisNetworkVersion.cs from cloned branch")?;
@@ -219,14 +259,15 @@ fn check_version(
 }
 
 fn check_channels(
-    temp_dir: &PathBuf,
-    rust_source: &PathBuf,
+    temp_dir: &Path,
+    rust_source: &Path,
     findings: &mut Vec<Finding>,
 ) -> Result<()> {
     let csharp = fs::read_to_string(
         temp_dir
             .join("Basis Server")
             .join("BasisNetworkCore")
+            .join("Protocol")
             .join("BasisNetworkCommons.cs"),
     )
     .context("reading BasisNetworkCommons.cs from cloned branch")?;
@@ -240,24 +281,31 @@ fn check_channels(
     .context("reading Rust channels.rs")?;
 
     let csharp_consts = extract_csharp_byte_consts(&csharp);
+    let rust_consts = extract_rust_u8_consts(&rust);
     for (name, value) in csharp_consts {
         let rust_name = csharp_name_to_rust(&name);
-        let needle = format!("pub const {rust_name}: u8 = {value};");
-        if !rust.contains(&needle) {
-            findings.push(Finding {
+        match rust_consts.get(&rust_name) {
+            Some(rust_value) if *rust_value == value => {}
+            Some(rust_value) => findings.push(Finding {
                 severity: "ERROR",
                 message: format!(
-                    "missing or changed channel constant: {name}={value} expected `{needle}`"
+                    "changed protocol constant: C# {name}={value}, Rust {rust_name}={rust_value}"
                 ),
-            });
+            }),
+            None => findings.push(Finding {
+                severity: "ERROR",
+                message: format!(
+                    "missing protocol constant: C# {name}={value} expected Rust `{rust_name}`"
+                ),
+            }),
         }
     }
     Ok(())
 }
 
 fn check_permission_nodes(
-    temp_dir: &PathBuf,
-    rust_source: &PathBuf,
+    temp_dir: &Path,
+    rust_source: &Path,
     findings: &mut Vec<Finding>,
 ) -> Result<()> {
     let csharp = fs::read_to_string(
@@ -289,14 +337,15 @@ fn check_permission_nodes(
 }
 
 fn check_config_fields(
-    temp_dir: &PathBuf,
-    rust_source: &PathBuf,
+    temp_dir: &Path,
+    rust_source: &Path,
     findings: &mut Vec<Finding>,
 ) -> Result<()> {
     let csharp = fs::read_to_string(
         temp_dir
             .join("Basis Server")
             .join("BasisNetworkCore")
+            .join("Configuration")
             .join("BasisServerConfiguration.cs"),
     )
     .context("reading BasisServerConfiguration.cs from cloned branch")?;
@@ -330,6 +379,9 @@ fn csharp_config_field_to_rust(field: &str) -> String {
         "BSRSIncreaseRate" => "bsrsincrease_rate".to_string(),
         "BSRSlowestSendRate" => "bsrslowest_send_rate".to_string(),
         "EnableBSRProfiling" => "enable_bsrprofiling".to_string(),
+        "BSRMaxDegreeOfParallelism" => "bsrmax_degree_of_parallelism".to_string(),
+        "BSRSendPhaseBudgetPercent" => "bsrsend_phase_budget_percent".to_string(),
+        "BSRMaxSliceCount" => "bsrmax_slice_count".to_string(),
         _ => pascal_to_snake(field),
     }
 }
@@ -347,6 +399,15 @@ fn first_number(text: &str) -> Option<u16> {
     digits.parse().ok()
 }
 
+fn parse_u8_literal(value: &str) -> Option<u8> {
+    let value = value.trim().trim_end_matches(';').trim();
+    if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+        u8::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse::<u8>().ok()
+    }
+}
+
 fn extract_csharp_byte_consts(text: &str) -> BTreeMap<String, u8> {
     let mut out = BTreeMap::new();
     for line in text.lines() {
@@ -355,9 +416,32 @@ fn extract_csharp_byte_consts(text: &str) -> BTreeMap<String, u8> {
             continue;
         }
         if let Some((name, value)) = line["public const byte ".len()..].split_once('=') {
-            if let Ok(value) = value.trim().trim_end_matches(';').trim().parse::<u8>() {
+            if let Some(value) = parse_u8_literal(value) {
                 out.insert(name.trim().to_string(), value);
             }
+        }
+    }
+    out
+}
+
+fn extract_rust_u8_consts(text: &str) -> BTreeMap<String, u8> {
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("pub const ") else {
+            continue;
+        };
+        let Some((name_and_type, value)) = rest.split_once('=') else {
+            continue;
+        };
+        let Some((name, ty)) = name_and_type.split_once(':') else {
+            continue;
+        };
+        if ty.trim() != "u8" {
+            continue;
+        }
+        if let Some(value) = parse_u8_literal(value) {
+            out.insert(name.trim().to_string(), value);
         }
     }
     out
@@ -401,11 +485,17 @@ fn extract_public_config_fields(text: &str) -> Vec<String> {
 }
 
 fn csharp_name_to_rust(name: &str) -> String {
-    if let Some(rest) = name.strip_prefix("EventType_") {
-        return format!("EVENT_TYPE_{}", pascal_to_snake(rest).to_ascii_uppercase());
-    }
-    if let Some(rest) = name.strip_prefix("P2PSub_") {
-        return format!("P2P_SUB_{}", pascal_to_snake(rest).to_ascii_uppercase());
+    for (prefix, rust_prefix) in [
+        ("EventType_", "EVENT_TYPE_"),
+        ("P2PSub_", "P2P_SUB_"),
+        ("ContentShareSub_", "CONTENT_SHARE_SUB_"),
+        ("RegistrySub_", "REGISTRY_SUB_"),
+        ("JiggleGrabOp_", "JIGGLE_GRAB_OP_"),
+        ("RejectKind_", "REJECT_KIND_"),
+    ] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return format!("{rust_prefix}{}", pascal_to_snake(rest).to_ascii_uppercase());
+        }
     }
     let name = name.strip_suffix("Channel").unwrap_or(name);
     match name {

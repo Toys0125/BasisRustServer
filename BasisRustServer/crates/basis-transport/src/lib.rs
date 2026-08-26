@@ -64,6 +64,7 @@ pub enum PacketProperty {
     InvalidProtocol = 15,
     NatMessage = 16,
     Empty = 17,
+    CompactMerged = 18,
 }
 
 impl PacketProperty {
@@ -87,6 +88,7 @@ impl PacketProperty {
             15 => Self::InvalidProtocol,
             16 => Self::NatMessage,
             17 => Self::Empty,
+            18 => Self::CompactMerged,
             _ => return None,
         })
     }
@@ -394,13 +396,17 @@ impl TransportHandle {
     }
 
     pub async fn reject(&self, request: &ConnectionRequest, reason: &str) -> Result<()> {
-        self.pending_requests.remove(&request.remote_addr);
         let mut payload = NetWriter::new();
         payload.put_string(reason);
+        self.reject_payload(request, payload.as_slice()).await
+    }
+
+    pub async fn reject_payload(&self, request: &ConnectionRequest, payload: &[u8]) -> Result<()> {
+        self.pending_requests.remove(&request.remote_addr);
         let mut writer = NetWriter::with_capacity(payload.len() + 9);
         writer.put_u8(PacketProperty::Disconnect as u8 | (request.connection_number << 5));
         writer.put_i64(request.connect_time);
-        writer.put_bytes(payload.as_slice());
+        writer.put_bytes(payload);
         self.send_raw_to(writer.as_slice(), request.remote_addr)
             .await?;
         Ok(())
@@ -515,7 +521,7 @@ impl TransportHandle {
             packet.extend_from_slice(payload.as_ref());
             return self
                 .try_send_raw_to(&packet, state.addr)
-                .map(|sent| usize::from(sent));
+                .map(usize::from);
         }
 
         let mut sent = 0usize;
@@ -620,17 +626,30 @@ impl TransportHandle {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_nat_introduce(
         &self,
         host_internal: SocketAddr,
         host_external: SocketAddr,
+        host_prediction_count: u8,
         client_internal: SocketAddr,
         client_external: SocketAddr,
+        client_prediction_count: u8,
         token: &str,
     ) -> Result<()> {
-        let to_client = build_nat_introduce_response(host_internal, host_external, token);
+        let to_client = build_nat_introduce_response(
+            host_internal,
+            host_external,
+            token,
+            host_prediction_count,
+        );
         self.send_raw_to(&to_client, client_external).await?;
-        let to_host = build_nat_introduce_response(client_internal, client_external, token);
+        let to_host = build_nat_introduce_response(
+            client_internal,
+            client_external,
+            token,
+            client_prediction_count,
+        );
         self.send_raw_to(&to_host, host_external).await?;
         Ok(())
     }
@@ -962,6 +981,14 @@ async fn process_packet(
                 }
             }
             process_merged_packet(handle, tx, remote_addr, bytes).await?;
+        }
+        PacketProperty::CompactMerged => {
+            if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
+                if let Some(peer) = handle.peers.get(&peer_id) {
+                    *peer.last_seen.lock() = Instant::now();
+                }
+            }
+            process_compact_merged_packet(handle, tx, remote_addr, connection_number, bytes).await?;
         }
         PacketProperty::MtuCheck => {
             if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
@@ -1345,6 +1372,7 @@ fn build_nat_introduce_response(
     internal: SocketAddr,
     external: SocketAddr,
     token: &str,
+    prediction_count: u8,
 ) -> Vec<u8> {
     let mut packet = Vec::with_capacity(1 + 8 + 2 * 19 + token.len() + 2);
     packet.push(PacketProperty::NatMessage as u8);
@@ -1352,6 +1380,8 @@ fn build_nat_introduce_response(
     write_litenet_endpoint(&mut packet, internal);
     write_litenet_endpoint(&mut packet, external);
     write_litenet_string(&mut packet, token);
+    // Current LiteNetLib appends NatIntroduceResponsePacket.PredictionCount.
+    packet.push(prediction_count);
     packet
 }
 
@@ -1473,6 +1503,75 @@ async fn process_merged_packet(
             Box::pin(process_packet(handle, tx, remote_addr, packet)).await?;
         }
         position += size;
+    }
+    Ok(())
+}
+
+async fn process_compact_merged_packet(
+    handle: &TransportHandle,
+    tx: &mpsc::Sender<ServerEvent>,
+    remote_addr: SocketAddr,
+    connection_number: u8,
+    bytes: &[u8],
+) -> Result<()> {
+    const LONG_LENGTH_FLAG: u8 = 0x80;
+    const RAW_PACKET_FLAG: u8 = 0x40;
+    const CHANNEL_MASK: u8 = 0x3f;
+
+    let mut position = 1usize;
+    while position < bytes.len() {
+        if bytes.len() - position < 2 {
+            break;
+        }
+
+        let tag = bytes[position];
+        position += 1;
+        let is_raw = tag & RAW_PACKET_FLAG != 0;
+        let channel = tag & CHANNEL_MASK;
+        if is_raw && channel != 0 {
+            break;
+        }
+
+        let payload_len = if tag & LONG_LENGTH_FLAG != 0 {
+            if bytes.len() - position < 2 {
+                break;
+            }
+            let len = u16::from_le_bytes([bytes[position], bytes[position + 1]]) as usize;
+            position += 2;
+            if len <= u8::MAX as usize {
+                break;
+            }
+            len
+        } else {
+            let len = bytes[position] as usize;
+            position += 1;
+            len
+        };
+
+        if payload_len > bytes.len() - position {
+            break;
+        }
+        let payload = &bytes[position..position + payload_len];
+        position += payload_len;
+
+        if is_raw {
+            if payload_len < 4 {
+                break;
+            }
+            let Some(property) = payload.first().and_then(|header| PacketProperty::from_byte(*header)) else {
+                break;
+            };
+            if !matches!(property, PacketProperty::Ack | PacketProperty::Channeled) {
+                break;
+            }
+            Box::pin(process_packet(handle, tx, remote_addr, payload)).await?;
+        } else {
+            let mut packet = Vec::with_capacity(payload_len + 2);
+            packet.push(PacketProperty::Unreliable as u8 | (connection_number << 5));
+            packet.push(channel);
+            packet.extend_from_slice(payload);
+            Box::pin(process_packet(handle, tx, remote_addr, &packet)).await?;
+        }
     }
     Ok(())
 }
@@ -1742,6 +1841,50 @@ mod tests {
         wrapped.push(PacketProperty::UnconnectedMessage as u8);
         wrapped.extend_from_slice(&payload);
         assert_eq!(server_info_payload(&wrapped).unwrap()[6..8], [0xFE, 0xCA]);
+    }
+
+    #[tokio::test]
+    async fn compact_merged_unreliable_entry_decodes_to_message_event() {
+        let (handle, _events) = TransportHandle::bind(any_addr(0)).await.unwrap();
+        let remote = UdpSocket::bind(any_addr(0)).await.unwrap();
+        let remote_addr = remote.local_addr().unwrap();
+        let request = ConnectionRequest {
+            remote_addr,
+            payload: Bytes::new(),
+            connection_number: 0,
+            connect_time: 123,
+            local_peer_id: 0,
+        };
+        let peer = handle.accept(&request).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+
+        let packet = [
+            PacketProperty::CompactMerged as u8,
+            channels::CHAT,
+            3,
+            1,
+            2,
+            3,
+        ];
+        process_compact_merged_packet(&handle, &tx, remote_addr, 0, &packet)
+            .await
+            .unwrap();
+
+        match rx.recv().await.unwrap() {
+            ServerEvent::Message {
+                peer: event_peer,
+                channel,
+                delivery,
+                payload,
+            } => {
+                assert_eq!(event_peer, peer);
+                assert_eq!(channel, channels::CHAT);
+                assert_eq!(delivery, DeliveryMethod::Unreliable);
+                assert_eq!(payload.as_ref(), &[1, 2, 3]);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        handle.shutdown();
     }
 
     #[tokio::test]

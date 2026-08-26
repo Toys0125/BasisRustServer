@@ -1,4 +1,6 @@
 pub mod avatar;
+mod avatar_bundle_dictionary;
+pub mod avatar_delta;
 pub mod channels;
 pub mod config;
 pub mod did;

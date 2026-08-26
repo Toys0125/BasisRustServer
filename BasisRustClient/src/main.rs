@@ -12,7 +12,16 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use basis_protocol::{channels, version::LITENETLIB_PROTOCOL_ID, version::SERVER_VERSION};
+use basis_protocol::{
+    channels,
+    io::{NetReader as ProtocolNetReader, NetWriter as ProtocolNetWriter},
+    messages::{
+        BasisDeserialize, BasisSerialize, ClientAvatarChangeMessage as ProtocolClientAvatarChangeMessage,
+        ClientMetaDataMessage as ProtocolClientMetaDataMessage,
+    },
+    version::LITENETLIB_PROTOCOL_ID,
+    version::SERVER_VERSION,
+};
 use basis_transport::{DeliveryMethod, PacketProperty};
 use clap::Parser;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
@@ -315,22 +324,8 @@ impl NetWriter {
         self.data.extend_from_slice(&value.to_le_bytes());
     }
 
-    fn put_f32(&mut self, value: f32) {
-        self.data.extend_from_slice(&value.to_le_bytes());
-    }
-
     fn put_bytes(&mut self, value: &[u8]) {
         self.data.extend_from_slice(value);
-    }
-
-    fn put_string(&mut self, value: &str) {
-        if value.is_empty() {
-            self.put_u16(0);
-            return;
-        }
-        let bytes = value.as_bytes();
-        self.put_u16((bytes.len() + 1) as u16);
-        self.put_bytes(bytes);
     }
 
     fn put_raw_len_string(&mut self, value: &str) {
@@ -366,9 +361,14 @@ impl ClientMetaDataMessage {
     }
 
     fn serialize(&self, writer: &mut NetWriter) {
-        writer.put_string(non_empty_or_failure(&self.player_uuid));
-        writer.put_string(non_empty_or_failure(&self.player_display_name));
-        writer.put_string(non_empty_or_failure(&self.player_platform));
+        let message = ProtocolClientMetaDataMessage {
+            player_uuid: non_empty_or_failure(&self.player_uuid).to_owned(),
+            player_display_name: non_empty_or_failure(&self.player_display_name).to_owned(),
+            player_platform: non_empty_or_failure(&self.player_platform).to_owned(),
+        };
+        let mut encoded = ProtocolNetWriter::new();
+        message.serialize(&mut encoded);
+        writer.put_bytes(encoded.as_slice());
     }
 }
 
@@ -420,10 +420,17 @@ impl ClientAvatarChangeMessage {
     }
 
     fn serialize(&self, writer: &mut NetWriter) {
-        writer.put_u8(self.load_mode);
-        writer.put_u16(self.byte_array.len() as u16);
-        writer.put_bytes(&self.byte_array);
-        writer.put_u8(self.local_avatar_index);
+        let message = ProtocolClientAvatarChangeMessage {
+            load_mode: self.load_mode,
+            byte_array: self.byte_array.clone(),
+            local_avatar_index: self.local_avatar_index,
+            arm_scale: 1.0,
+            leg_scale: 1.0,
+            torso_scale: 1.0,
+        };
+        let mut encoded = ProtocolNetWriter::new();
+        message.serialize(&mut encoded);
+        writer.put_bytes(encoded.as_slice());
     }
 }
 
@@ -450,19 +457,19 @@ enum BitQuality {
 impl BitQuality {
     fn payload_len(self) -> usize {
         match self {
-            Self::VeryLow => 112,
-            Self::Low => 131,
-            Self::Medium => 156,
-            Self::High => 182,
+            Self::VeryLow => 74,
+            Self::Low => 83,
+            Self::Medium => 97,
+            Self::High => 159,
         }
     }
 
     fn rotation_len(self) -> usize {
         match self {
-            Self::VeryLow => 78,
-            Self::Low => 97,
-            Self::Medium => 122,
-            Self::High => 148,
+            Self::VeryLow => 44,
+            Self::Low => 53,
+            Self::Medium => 67,
+            Self::High => 94,
         }
     }
 }
@@ -528,21 +535,24 @@ impl PoseState {
     fn high_quality_payload(&mut self, elapsed_secs: f32) -> Vec<u8> {
         self.drift();
         let mut writer = NetWriter::with_capacity(BitQuality::High.payload_len());
-        writer.put_f32(self.base[0]);
-        writer.put_f32(self.base[1] + elapsed_secs.sin() * 0.015);
-        writer.put_f32(self.base[2]);
+        writer.put_bytes(&encode_axis_mm(self.base[0]));
+        writer.put_bytes(&encode_axis_mm(self.base[1] + elapsed_secs.sin() * 0.015));
+        writer.put_bytes(&encode_axis_mm(self.base[2]));
 
-        let mut rotations = vec![0u8; BitQuality::High.rotation_len()];
-        FakePoseGenerator::write_high_quality_rotations(&mut rotations, elapsed_secs);
-        writer.put_bytes(&rotations);
+        // v54's rotation block is 21 body fields plus 10 finger curl/splay fields. A zeroed
+        // block is sufficient for this synthetic load client; it no longer tries to emit the
+        // obsolete 51-bone v33 layout.
+        writer.put_bytes(&vec![0u8; BitQuality::High.rotation_len()]);
 
         writer.put_u16(compress_scale(1.0));
-        writer.put_bytes(&smallest_three_quaternion([0.0, 0.0, 0.0, 1.0]));
-        writer.put_bytes(&[0; 6]);
-        writer.put_bytes(&[3, 0, 0x80, 0, 0x80, 0, 0x80]);
+        let identity = smallest_three_quaternion([0.0, 0.0, 0.0, 1.0]);
+        writer.put_bytes(&identity);
+        writer.put_bytes(&[0; 5]);
+        writer.put_bytes(&identity);
+        writer.put_bytes(&[0; 35]);
 
-        let mut payload = writer.into_vec();
-        payload.resize(BitQuality::High.payload_len(), 0);
+        let payload = writer.into_vec();
+        debug_assert_eq!(payload.len(), BitQuality::High.payload_len());
         payload
     }
 
@@ -552,79 +562,6 @@ impl PoseState {
         self.packet[0] = sequence;
         self.packet[1..].copy_from_slice(&payload);
         &self.packet
-    }
-}
-
-struct FakePoseGenerator;
-
-impl FakePoseGenerator {
-    fn write_high_quality_rotations(target: &mut [u8], elapsed_secs: f32) {
-        const BPC_HIGH: [u8; 51] = [
-            10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 9, 9, 5, 5, 6, 6,
-            6, 6, 5, 6, 6, 6, 6, 5, 6, 6, 5, 5, 5, 6, 6, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-        ];
-        const MAX_COMPONENT: [f32; 51] = [
-            0.70710677, 0.70710677, 0.50, 0.70710677, 0.70710677, 0.70710677, 0.70710677,
-            0.70710677, 0.70710677, 0.70710677, 0.70710677, 0.70710677, 0.70710677, 0.50, 0.50,
-            0.70710677, 0.70710677, 0.60, 0.60, 0.50, 0.50, 0.68, 0.68, 0.68, 0.68, 0.68, 0.68,
-            0.68, 0.68, 0.68, 0.68, 0.58, 0.58, 0.58, 0.58, 0.58, 0.58, 0.58, 0.58, 0.58, 0.58,
-            0.65, 0.65, 0.65, 0.65, 0.65, 0.65, 0.65, 0.65, 0.65, 0.65,
-        ];
-
-        target.fill(0);
-        let mut bit_writer = BitWriter::new(target);
-        for bone in 0..51 {
-            let sway = (elapsed_secs * 0.7 + bone as f32 * 0.11).sin() * 0.006;
-            let q = match bone {
-                0 => [0.0, sway, 0.0, 1.0],
-                1..=3 => [sway * 0.25, 0.0, 0.0, 1.0],
-                10..=20 => [0.0, 0.0, sway * 0.35, 1.0],
-                _ => [0.0, 0.0, 0.0, 1.0],
-            };
-            bit_writer.write_smallest_three(q, BPC_HIGH[bone] as usize, MAX_COMPONENT[bone]);
-        }
-    }
-}
-
-struct BitWriter<'a> {
-    data: &'a mut [u8],
-    bit: usize,
-}
-
-impl<'a> BitWriter<'a> {
-    fn new(data: &'a mut [u8]) -> Self {
-        Self { data, bit: 0 }
-    }
-
-    fn write_bits(&mut self, mut value: u32, count: usize) {
-        for _ in 0..count {
-            let byte = self.bit / 8;
-            if byte >= self.data.len() {
-                return;
-            }
-            let bit = self.bit % 8;
-            if (value & 1) != 0 {
-                self.data[byte] |= 1 << bit;
-            }
-            value >>= 1;
-            self.bit += 1;
-        }
-    }
-
-    fn write_smallest_three(&mut self, q: [f32; 4], bits_per_component: usize, max_range: f32) {
-        let normalized = normalize_quat(q);
-        let (largest, sign) = largest_component(normalized);
-        self.write_bits(largest as u32, 2);
-        let max_quantized = (1u32 << bits_per_component) - 1;
-        for i in 0..4 {
-            if i == largest {
-                continue;
-            }
-            let normalized_component = ((normalized[i] * sign) / max_range).clamp(-1.0, 1.0);
-            let quantized =
-                ((normalized_component * 0.5 + 0.5) * max_quantized as f32).round() as u32;
-            self.write_bits(quantized.min(max_quantized), bits_per_component);
-        }
     }
 }
 
@@ -677,6 +614,21 @@ fn compress_scale(scale: f32) -> u16 {
     const MAX: f32 = 150.0;
     const RANGE: f32 = MAX - MIN;
     (((scale - MIN) / RANGE) * u16::MAX as f32).trunc() as u16
+}
+
+fn encode_axis_mm(meters: f32) -> [u8; 3] {
+    const LIMIT: i32 = (1 << 23) - 1;
+    let mm_f = meters * 1000.0;
+    let mm = if mm_f.is_nan() {
+        0
+    } else if mm_f >= LIMIT as f32 {
+        LIMIT
+    } else if mm_f <= -(LIMIT as f32) {
+        -LIMIT
+    } else {
+        mm_f.round() as i32
+    };
+    [mm as u8, (mm >> 8) as u8, (mm >> 16) as u8]
 }
 
 fn build_connection_payload(config: &Config, ready: &ReadyMessage) -> Vec<u8> {
@@ -1028,6 +980,61 @@ impl BasisClient {
                     }
                     Box::pin(self.handle_packet(&bytes[pos..pos + size])).await?;
                     pos += size;
+                }
+            }
+            PacketProperty::CompactMerged => {
+                const LONG_LENGTH_FLAG: u8 = 0x80;
+                const RAW_PACKET_FLAG: u8 = 0x40;
+                const CHANNEL_MASK: u8 = 0x3f;
+                let connection_number = (bytes[0] & 0x60) >> 5;
+                let mut pos = 1usize;
+                while pos < bytes.len() {
+                    if bytes.len() - pos < 2 {
+                        break;
+                    }
+                    let tag = bytes[pos];
+                    pos += 1;
+                    let is_raw = tag & RAW_PACKET_FLAG != 0;
+                    let channel = tag & CHANNEL_MASK;
+                    if is_raw && channel != 0 {
+                        break;
+                    }
+                    let payload_len = if tag & LONG_LENGTH_FLAG != 0 {
+                        if bytes.len() - pos < 2 {
+                            break;
+                        }
+                        let len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+                        pos += 2;
+                        if len <= u8::MAX as usize {
+                            break;
+                        }
+                        len
+                    } else {
+                        let len = bytes[pos] as usize;
+                        pos += 1;
+                        len
+                    };
+                    if payload_len > bytes.len() - pos {
+                        break;
+                    }
+                    let payload = &bytes[pos..pos + payload_len];
+                    pos += payload_len;
+                    if is_raw {
+                        if payload_len < 4 {
+                            break;
+                        }
+                        let property = PacketProperty::from_byte(payload[0]);
+                        if !matches!(property, Some(PacketProperty::Ack | PacketProperty::Channeled)) {
+                            break;
+                        }
+                        Box::pin(self.handle_packet(payload)).await?;
+                    } else {
+                        let mut packet = Vec::with_capacity(payload_len + 2);
+                        packet.push(PacketProperty::Unreliable as u8 | (connection_number << 5));
+                        packet.push(channel);
+                        packet.extend_from_slice(payload);
+                        Box::pin(self.handle_packet(&packet)).await?;
+                    }
                 }
             }
             _ => {}
@@ -2273,16 +2280,16 @@ mod tests {
     #[test]
     fn relative_voice_audio_folder_resolves_from_config_directory() {
         let resolved = resolve_relative_to_config(
-            Path::new(r"C:\work\BasisRustClient\Config.xml"),
+            Path::new("/work/BasisRustClient/Config.xml"),
             DEFAULT_VOICE_AUDIO_FOLDER,
         );
-        assert!(resolved.ends_with(r"BasisRustClient\audio"));
+        assert!(resolved.ends_with("BasisRustClient/audio"));
 
         let absolute = resolve_relative_to_config(
-            Path::new(r"C:\work\BasisRustClient\Config.xml"),
-            r"C:\samples\voice",
+            Path::new("/work/BasisRustClient/Config.xml"),
+            "/samples/voice",
         );
-        assert_eq!(absolute, r"C:\samples\voice");
+        assert_eq!(absolute, "/samples/voice");
     }
 
     #[test]
@@ -2375,9 +2382,11 @@ mod tests {
         }
         .serialize(&mut writer);
         let bytes = writer.into_vec();
-        assert_eq!(read_lnl_string(&bytes, 0).0, "Failure");
-        let (_, next) = read_lnl_string(&bytes, 0);
-        assert_eq!(read_lnl_string(&bytes, next).0, "Failure");
+        let mut reader = ProtocolNetReader::new(&bytes);
+        let decoded = ProtocolClientMetaDataMessage::deserialize(&mut reader).unwrap();
+        assert_eq!(decoded.player_uuid, "Failure");
+        assert_eq!(decoded.player_display_name, "Failure");
+        assert_eq!(decoded.player_platform, "Failure");
     }
 
     #[test]
@@ -2413,11 +2422,12 @@ mod tests {
     fn high_quality_payload_and_movement_packet_sizes_match() {
         let mut pose = PoseState::new_random();
         let payload = pose.high_quality_payload(0.0);
-        assert_eq!(payload.len(), 182);
-        assert_eq!(u16::from_le_bytes([payload[160], payload[161]]), 434);
-        assert_eq!(&payload[169..175], &[0, 0, 0, 0, 0, 0]);
+        assert_eq!(payload.len(), 159);
+        assert_eq!(u16::from_le_bytes([payload[103], payload[104]]), 434);
+        assert_eq!(&payload[112..117], &[0, 0, 0, 0, 0]);
+        assert_eq!(&payload[124..159], &[0; 35]);
         let packet = build_movement_packet(7, &mut pose, SystemTime::now());
-        assert_eq!(packet.len(), 183);
+        assert_eq!(packet.len(), 160);
         assert_eq!(packet[0], 7);
     }
 
@@ -2439,9 +2449,13 @@ mod tests {
     fn initial_ready_pose_uses_spawn_base() {
         let ready = ReadyMessage::new(&Config::default(), [1000.0, 2.0, -3.0]).unwrap();
         let payload = &ready.local_avatar_sync.payload;
-        let x = f32::from_le_bytes(payload[0..4].try_into().unwrap());
-        let y = f32::from_le_bytes(payload[4..8].try_into().unwrap());
-        let z = f32::from_le_bytes(payload[8..12].try_into().unwrap());
+        let decode_axis = |bytes: &[u8]| {
+            let raw = (bytes[0] as i32) | ((bytes[1] as i32) << 8) | ((bytes[2] as i32) << 16);
+            ((raw << 8) >> 8) as f32 * 0.001
+        };
+        let x = decode_axis(&payload[0..3]);
+        let y = decode_axis(&payload[3..6]);
+        let z = decode_axis(&payload[6..9]);
 
         assert!((999.75..=1000.25).contains(&x));
         assert!((1.75..=2.25).contains(&y));
@@ -2520,18 +2534,6 @@ mod tests {
         page.extend_from_slice(segments);
         page.extend_from_slice(data);
         page
-    }
-
-    fn read_lnl_string(bytes: &[u8], offset: usize) -> (String, usize) {
-        let len_plus = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) as usize;
-        if len_plus == 0 {
-            return (String::new(), offset + 2);
-        }
-        let len = len_plus - 1;
-        (
-            String::from_utf8(bytes[offset + 2..offset + 2 + len].to_vec()).unwrap(),
-            offset + 2 + len,
-        )
     }
 
     fn read_raw_len_string(bytes: &[u8], offset: usize) -> (String, usize) {
